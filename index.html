@@ -188,11 +188,15 @@
   </div>
 
 <script>
+  // ─── Config ──────────────────────────────────────────────────────
+  const WS_URL = 'wss://complete-else-recommendations-basis.trycloudflare.com/';
+
   // ─── State ───────────────────────────────────────────────────────
   let ttsEnabled = false;
   let voices = [];
   const queue = [];
   let speaking = false;
+  let worker = null;
 
   // ─── Elements ────────────────────────────────────────────────────
   const dot          = document.getElementById('dot');
@@ -216,7 +220,6 @@
       const opt = document.createElement('option');
       opt.value = i;
       opt.textContent = `${v.name} (${v.lang})`;
-      // предпочитаем русский голос по умолчанию
       if (v.lang.startsWith('ru')) opt.selected = true;
       voiceSelect.appendChild(opt);
     });
@@ -229,15 +232,12 @@
 
   // ─── Enable button ───────────────────────────────────────────────
   enableBtn.addEventListener('click', () => {
-    // Браузер требует жест пользователя для запуска AudioContext / speechSynthesis
     const test = new SpeechSynthesisUtterance('');
     speechSynthesis.speak(test);
 
     ttsEnabled = true;
     enableBtn.textContent = '✅ Озвучка включена';
     enableBtn.disabled = true;
-
-    // Проговорить всё что накопилось в очереди
     processQueue();
   });
 
@@ -248,7 +248,7 @@
     const { text, card } = queue.shift();
     speaking = true;
     speakingInd.classList.add('active');
-    card.classList.add('speaking');
+    if (card) card.classList.add('speaking');
 
     const utter = new SpeechSynthesisUtterance(text);
     utter.voice  = voices[voiceSelect.value] || null;
@@ -258,7 +258,7 @@
     utter.onend = utter.onerror = () => {
       speaking = false;
       speakingInd.classList.remove('active');
-      card.classList.remove('speaking');
+      if (card) card.classList.remove('speaking');
       processQueue();
     };
 
@@ -284,10 +284,7 @@
       <div class="msg-text">${escHtml(msg.text)}</div>
     `;
     feed.prepend(card);
-
-    // Ограничиваем ленту 30 сообщениями
     while (feed.children.length > 30) feed.removeChild(feed.lastChild);
-
     return card;
   }
 
@@ -298,31 +295,128 @@
       .replace(/>/g,'&gt;');
   }
 
-  // ─── WebSocket ────────────────────────────────────────────────────
-  function connect() {
-    const ws = new WebSocket(`wss://complete-else-recommendations-basis.trycloudflare.com/`);
+  // ════════════════════════════════════════════════════════════════════
+  //  Web Worker — WebSocket живёт здесь и НЕ замораживается
+  //  при свёртывании окна или переключении вкладки
+  // ════════════════════════════════════════════════════════════════════
+  const workerCode = `
+    let ws = null;
+    let pingTimer = null;
+    const PING_INTERVAL = 25000;   // пинг каждые 25 сек
+    const RECONNECT_BASE = 2000;   // начальная задержка реконнекта
+    const RECONNECT_MAX  = 30000;  // максимальная задержка
+    let reconnectDelay = RECONNECT_BASE;
+    let url = '';
 
-    ws.onopen = () => {
-      dot.classList.add('connected');
-      statusText.textContent = 'Подключено к серверу';
+    function connect() {
+      if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+
+      try { ws = new WebSocket(url); } catch(e) {
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        reconnectDelay = RECONNECT_BASE;
+        postMessage({ type: 'status', connected: true });
+        startPing();
+      };
+
+      ws.onmessage = (e) => {
+        // Если это pong от сервера — игнорируем
+        if (e.data === 'pong' || e.data === '{}') return;
+        try {
+          const msg = JSON.parse(e.data);
+          postMessage({ type: 'message', data: msg });
+        } catch(err) {
+          // не JSON — возможно pong, игнорируем
+        }
+      };
+
+      ws.onclose = () => {
+        stopPing();
+        postMessage({ type: 'status', connected: false });
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    function startPing() {
+      stopPing();
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === 1) {
+          try { ws.send('ping'); } catch(e) {}
+        }
+      }, PING_INTERVAL);
+    }
+
+    function stopPing() {
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    }
+
+    function scheduleReconnect() {
+      setTimeout(() => connect(), reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.5, RECONNECT_MAX);
+    }
+
+    // Принимаем команды из основного потока
+    onmessage = (e) => {
+      const cmd = e.data;
+      if (cmd.type === 'init') {
+        url = cmd.url;
+        connect();
+      } else if (cmd.type === 'reconnect') {
+        // Принудительный реконнект (при возврате на вкладку)
+        if (!ws || ws.readyState > 1) {
+          reconnectDelay = RECONNECT_BASE;
+          connect();
+        }
+      }
     };
+  `;
 
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      const card = addCard(msg);
-      speakMessage(msg.text, card);
-    };
+  // Создаём Worker из Blob
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  worker = new Worker(URL.createObjectURL(blob));
 
-    ws.onclose = () => {
-      dot.classList.remove('connected');
-      statusText.textContent = 'Соединение потеряно. Переподключение...';
-      setTimeout(connect, 3000);
-    };
+  // Обработка сообщений из Worker
+  worker.onmessage = (e) => {
+    const msg = e.data;
 
-    ws.onerror = () => ws.close();
-  }
+    if (msg.type === 'status') {
+      if (msg.connected) {
+        dot.classList.add('connected');
+        statusText.textContent = 'Подключено к серверу';
+      } else {
+        dot.classList.remove('connected');
+        statusText.textContent = 'Соединение потеряно. Переподключение...';
+      }
+    }
 
-  connect();
+    if (msg.type === 'message') {
+      const card = addCard(msg.data);
+      speakMessage(msg.data.text, card);
+    }
+  };
+
+  // Запускаем Worker
+  worker.postMessage({ type: 'init', url: WS_URL });
+
+  // ─── Visibility API — мгновенный реконнект при возврате ──────────
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      // При возврате на вкладку — просим worker проверить соединение
+      worker.postMessage({ type: 'reconnect' });
+    }
+  });
+
+  // ─── Fallback: периодическая проверка (на случай потери) ──────────
+  setInterval(() => {
+    worker.postMessage({ type: 'reconnect' });
+  }, 60000);
 </script>
 </body>
 </html>
